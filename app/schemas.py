@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RoomCreate(BaseModel):
@@ -43,3 +43,33 @@ class EventReport(BaseModel):
     participant_id: str = Field(min_length=1, max_length=100)
     seq: int = Field(ge=0, description="该参与者单调递增的事件序号")
     position: int = Field(ge=0, description="已到达的台词位置（从 0 开始）")
+
+
+class LineOperation(BaseModel):
+    """单条台本修订操作；``position`` 一律指修订前（当前）行号。"""
+
+    op: Literal["insert", "replace", "delete"]
+    position: int = Field(
+        ge=0,
+        description="当前台本行号；insert 允许等于台词总数（追加到末尾）",
+    )
+    text: Optional[str] = Field(default=None, description="insert/replace 的台词文本")
+
+    @model_validator(mode="after")
+    def _check_text(self) -> "LineOperation":
+        if self.op in ("insert", "replace"):
+            if self.text is None or not self.text.strip():
+                raise ValueError(f"{self.op} 操作必须提供非空台词文本 text")
+            self.text = self.text.strip()
+        elif self.text is not None:
+            raise ValueError("delete 操作不接受 text 字段")
+        return self
+
+
+class LinesPatch(BaseModel):
+    """台本增量修订：``base_revision`` 必须等于当前版本，操作整批原子生效。"""
+
+    base_revision: int = Field(
+        ge=0, description="客户端基于的台本版本；与当前版本不一致时返回 409"
+    )
+    operations: List[LineOperation] = Field(min_length=1)

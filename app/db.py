@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS rooms (
     advance_threshold      INTEGER NOT NULL CHECK (advance_threshold >= 1),
     offline_timeout_seconds INTEGER NOT NULL CHECK (offline_timeout_seconds >= 1),
     public_position        INTEGER NOT NULL DEFAULT -1,
+    revision               INTEGER NOT NULL DEFAULT 0,
     created_at             REAL NOT NULL
 );
 
@@ -69,6 +70,16 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的旧库幂等补齐后加的列（rooms.revision：台本版本号）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(rooms)")}
+    if "revision" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+        )

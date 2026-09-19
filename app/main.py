@@ -4,6 +4,12 @@
 单调递增事件序号和已到达的台词位置。服务幂等处理重复或乱序上报，
 公共位置只推进到达到指定人数的最高台词且绝不回退；超时参与者退出
 推进人数计算。状态接口返回当前活跃成员、公共位置及最近一次推进原因。
+
+台本支持整体导入（重置进度并开启新版本）与增量修订（PATCH）：修订按
+当前行号执行 insert/replace/delete，整批在事务中校验，版本不匹配返回
+409，任一越界则全部不落库；修订后参与者与公共位置按原先指向的台词
+身份重排——保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
+无前一行则置为 -1，且修订本身不产生推进记录。
 """
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Response
 
 from .db import connect, init_db
-from .schemas import EventReport, LinesImport, RoomCreate
+from .schemas import EventReport, LinesImport, LinesPatch, RoomCreate
 
 
 def _now() -> float:
@@ -33,7 +39,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -103,6 +109,7 @@ def _room_payload(room) -> Dict[str, Any]:
         "advance_threshold": room["advance_threshold"],
         "offline_timeout_seconds": room["offline_timeout_seconds"],
         "public_position": room["public_position"],
+        "revision": room["revision"],
         "created_at": room["created_at"],
     }
 
@@ -156,6 +163,7 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "advance_threshold": room["advance_threshold"],
         "offline_timeout_seconds": room["offline_timeout_seconds"],
         "lines_count": lines_count,
+        "revision": room["revision"],
         "public_position": public_position,
         "current_line": current_line,
         "active_participants": participants,
@@ -218,21 +226,25 @@ def get_room(room_id: str) -> Dict[str, Any]:
 
 @app.post("/rooms/{room_id}/lines")
 def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
-    """导入有序台词（整体替换）。重复导入同一台本结果一致（幂等）。
+    """导入有序台词（整体替换），重置进度并开启新的台本版本。
 
     台本变化后旧的位置上报不再有意义，因此导入会重置公共位置、
-    参与者与推进历史。
+    参与者与推进历史；每次导入版本号（revision）递增。
     """
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        _get_room(conn, room_id)
+        room = _get_room(conn, room_id)
         conn.execute("DELETE FROM lines WHERE room_id = ?", (room_id,))
         conn.executemany(
             "INSERT INTO lines (room_id, position, text) VALUES (?, ?, ?)",
             [(room_id, position, text) for position, text in enumerate(payload.lines)],
         )
-        conn.execute("UPDATE rooms SET public_position = -1 WHERE id = ?", (room_id,))
+        new_revision = room["revision"] + 1
+        conn.execute(
+            "UPDATE rooms SET public_position = -1, revision = ? WHERE id = ?",
+            (new_revision, room_id),
+        )
         conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM advancements WHERE room_id = ?", (room_id,))
         conn.commit()
@@ -240,6 +252,7 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
             "room_id": room_id,
             "lines_imported": len(payload.lines),
             "progress_reset": True,
+            "revision": new_revision,
         }
     except Exception:
         conn.rollback()
@@ -252,12 +265,149 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
 def list_lines(room_id: str) -> Dict[str, Any]:
     conn = connect()
     try:
-        _get_room(conn, room_id)
+        room = _get_room(conn, room_id)
         rows = conn.execute(
             "SELECT position, text FROM lines WHERE room_id = ? ORDER BY position",
             (room_id,),
         ).fetchall()
-        return {"room_id": room_id, "lines": [dict(row) for row in rows]}
+        return {
+            "room_id": room_id,
+            "revision": room["revision"],
+            "lines": [dict(row) for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.patch("/rooms/{room_id}/lines")
+def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
+    """台本增量修订：按当前行号执行 insert/replace/delete，整批原子生效。
+
+    所有操作的 ``position`` 都指修订前（``base_revision`` 对应）的行号；
+    insert 允许 ``position == 台词总数``（追加到末尾）。``base_revision``
+    与当前版本不一致返回 409；任一操作越界或与同一行的其他操作冲突，
+    整批不落库。修订成功后版本递增，参与者与公共位置按原先指向的台词
+    身份重排：保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
+    无前一行则置为 -1。修订本身不写入推进记录。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        room = _get_room(conn, room_id)
+        if payload.base_revision != room["revision"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"台本版本不匹配: base_revision={payload.base_revision}, "
+                    f"当前 revision={room['revision']}"
+                ),
+            )
+
+        old_rows = conn.execute(
+            "SELECT text FROM lines WHERE room_id = ? ORDER BY position",
+            (room_id,),
+        ).fetchall()
+        old_texts = [row["text"] for row in old_rows]
+        total = len(old_texts)
+
+        # ---- 整批校验：任一越界或冲突都抛错，事务回滚后全部不落库 ----
+        inserts: Dict[int, List[str]] = {}   # 锚定行号 -> 依次插入的文本
+        replaced: Dict[int, str] = {}        # 被替换的行号 -> 新文本
+        deleted: set[int] = set()            # 被删除的行号
+        for op in payload.operations:
+            if op.op == "insert":
+                if op.position > total:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"insert 位置越界: position={op.position}, 台词总数={total}",
+                    )
+                inserts.setdefault(op.position, []).append(op.text)
+            else:
+                if op.position >= total:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"{op.op} 位置越界: position={op.position}, 台词总数={total}",
+                    )
+                if op.position in replaced or op.position in deleted:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"台词 {op.position} 上存在冲突的修订操作",
+                    )
+                if op.op == "replace":
+                    replaced[op.position] = op.text
+                else:
+                    deleted.add(op.position)
+
+        # ---- 应用：构建新台本，并记录每个新行来自的旧行号（台词身份）----
+        new_texts: List[str] = []
+        origin: List[Optional[int]] = []  # 新行号 -> 旧行号；None 表示新插入
+        for position in range(total):
+            for text in inserts.get(position, ()):
+                new_texts.append(text)
+                origin.append(None)
+            if position in deleted:
+                continue
+            new_texts.append(replaced.get(position, old_texts[position]))
+            origin.append(position)
+        for text in inserts.get(total, ()):
+            new_texts.append(text)
+            origin.append(None)
+
+        # 仍保留的旧行号 -> 新行号
+        kept = {old_pos: new_pos for new_pos, old_pos in enumerate(origin)
+                if old_pos is not None}
+
+        def remap(position: int) -> int:
+            """把旧行号映射到新行号：保留则跟随；被删除则回退到最近仍保留的
+            前一行，无前一行则置为 -1。"""
+            probe = position
+            while probe >= 0:
+                if probe in kept:
+                    return kept[probe]
+                probe -= 1
+            return -1
+
+        # ---- 重排参与者与公共位置（不触发推进、不写推进记录）----
+        participants = conn.execute(
+            "SELECT participant_id, position FROM participants WHERE room_id = ?",
+            (room_id,),
+        ).fetchall()
+        remapped = 0
+        for row in participants:
+            new_position = remap(row["position"])
+            if new_position != row["position"]:
+                conn.execute(
+                    """
+                    UPDATE participants SET position = ?
+                    WHERE room_id = ? AND participant_id = ?
+                    """,
+                    (new_position, room_id, row["participant_id"]),
+                )
+                remapped += 1
+        new_public_position = remap(room["public_position"])
+
+        # ---- 落库新台本并递增版本 ----
+        conn.execute("DELETE FROM lines WHERE room_id = ?", (room_id,))
+        conn.executemany(
+            "INSERT INTO lines (room_id, position, text) VALUES (?, ?, ?)",
+            [(room_id, position, text) for position, text in enumerate(new_texts)],
+        )
+        new_revision = room["revision"] + 1
+        conn.execute(
+            "UPDATE rooms SET public_position = ?, revision = ? WHERE id = ?",
+            (new_public_position, new_revision, room_id),
+        )
+        conn.commit()
+        return {
+            "room_id": room_id,
+            "revision": new_revision,
+            "lines_count": len(new_texts),
+            "public_position": new_public_position,
+            "participants_remapped": remapped,
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
