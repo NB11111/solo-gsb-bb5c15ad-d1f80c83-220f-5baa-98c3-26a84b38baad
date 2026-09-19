@@ -1,13 +1,15 @@
 """SQLite 连接与建表。
 
 数据库路径通过环境变量 ``DB_PATH`` 配置，默认当前目录下的
-``teleprompter.db``。``init_db()`` 在服务启动时调用，幂等建表。
+``teleprompter.db``。``init_db()`` 在服务启动时调用，幂等建表，并对
+早期版本的库做增量迁移（``rooms.revision`` 与 ``lines.line_id``）。
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 
 DEFAULT_DB_PATH = "teleprompter.db"
@@ -19,14 +21,17 @@ CREATE TABLE IF NOT EXISTS rooms (
     advance_threshold      INTEGER NOT NULL CHECK (advance_threshold >= 1),
     offline_timeout_seconds INTEGER NOT NULL CHECK (offline_timeout_seconds >= 1),
     public_position        INTEGER NOT NULL DEFAULT -1,
+    revision               INTEGER NOT NULL DEFAULT 0,
     created_at             REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS lines (
     room_id  TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
+    line_id  TEXT NOT NULL,
     text     TEXT NOT NULL,
-    PRIMARY KEY (room_id, position)
+    PRIMARY KEY (room_id, position),
+    UNIQUE (room_id, line_id)
 );
 
 CREATE TABLE IF NOT EXISTS participants (
@@ -62,6 +67,31 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把旧版本库升级到当前结构：补 revision / line_id 列并回填身份。"""
+    room_cols = _columns(conn, "rooms")
+    if "revision" not in room_cols:
+        # 老库当前没有版本概念，现存台本视为第 0 版；客户端先查询再修订
+        conn.execute("ALTER TABLE rooms ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+
+    line_cols = _columns(conn, "lines")
+    if "line_id" not in line_cols:
+        conn.execute("ALTER TABLE lines ADD COLUMN line_id TEXT")
+        rows = conn.execute("SELECT room_id, position FROM lines").fetchall()
+        conn.executemany(
+            "UPDATE lines SET line_id = ? WHERE room_id = ? AND position = ?",
+            [(uuid.uuid4().hex, row["room_id"], row["position"]) for row in rows],
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_lines_identity "
+        "ON lines(room_id, line_id)"
+    )
+
+
 def init_db() -> None:
     path = db_path()
     if path != ":memory:":
@@ -69,6 +99,7 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
